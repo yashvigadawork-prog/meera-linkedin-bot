@@ -1,17 +1,16 @@
 import { config } from '../lib/config.js';
 import { sendMessage, sendChatAction, downloadFileAsBase64 } from '../lib/telegram.js';
 import { transcribeAudio } from '../lib/transcribe.js';
-import { generateDraft } from '../lib/draft.js';
+import { generateDraft, NOT_ENOUGH_PREFIX } from '../lib/draft.js';
 
 const START_MESSAGE =
   "Hi, I'm your LinkedIn drafting bot.\n\n" +
   'Send me a voice note or a typed fragment - a half-formed thought, a reaction to a customer DM, ' +
-  'a manufacturer conversation - and I\'ll draft a LinkedIn post in your voice.\n\n' +
+  "a manufacturer conversation - and I'll draft a LinkedIn post in your voice, automatically pulling " +
+  'in supporting industry research and news where relevant.\n\n' +
   'Optional: add a line starting with "Angle:" (in a text message, or in the caption of an audio file) ' +
-  'to give me a news angle or data point to weave in.\n\n' +
+  "to hand me a specific news angle or data point yourself instead of relying on my own search.\n\n" +
   'I only ever draft. I never post or schedule anything - you review every draft here and post it yourself.';
-
-const NOT_ENOUGH_PREFIX = 'NOT ENOUGH TO DRAFT:';
 
 // Splits raw input into the actual fragment and an optional supplied
 // "Angle:" line, e.g. a news angle or industry data point to weave in.
@@ -27,7 +26,26 @@ function parseFragmentAndAngle(rawText) {
   return { fragment, angle };
 }
 
-function formatReply(draft) {
+// usedSources/candidatesFound/markerFound come straight from generateDraft():
+// - usedSources non-empty -> the model told us exactly which candidates it drew on.
+// - markerFound but usedSources empty -> the model explicitly used none of them.
+// - !markerFound but candidatesFound > 0 -> can't tell which (if any) were used.
+// - candidatesFound === 0 -> no research was even found, nothing to show.
+function formatResearchFooter({ usedSources, candidatesFound, markerFound }) {
+  if (usedSources.length) {
+    const lines = usedSources.map((s, i) => `${i + 1}. ${s.title} — ${s.link}`);
+    return `\n\n---\nResearch used for this draft (verify before posting):\n${lines.join('\n')}`;
+  }
+  if (!markerFound && candidatesFound > 0) {
+    return (
+      '\n\n---\nResearch was gathered but I could not confirm which parts (if any) made it ' +
+      'into the draft - verify anything specific before posting.'
+    );
+  }
+  return '';
+}
+
+function formatReply(draft, research) {
   if (draft.startsWith(NOT_ENOUGH_PREFIX)) {
     return `Need more to go on before I can draft this one.\n\n${draft.slice(NOT_ENOUGH_PREFIX.length).trim()}`;
   }
@@ -36,7 +54,8 @@ function formatReply(draft) {
     '—\n\n' +
     `${draft}\n\n` +
     '—\n' +
-    'You post this yourself, whenever and if you want to.'
+    'You post this yourself, whenever and if you want to.' +
+    formatResearchFooter(research)
   );
 }
 
@@ -78,8 +97,8 @@ async function handleMessage(message) {
   }
 
   await sendChatAction(chatId, 'typing');
-  const draft = await generateDraft(fragment, angle);
-  await sendMessage(chatId, formatReply(draft));
+  const { draft, usedSources, candidatesFound, markerFound } = await generateDraft(fragment, angle);
+  await sendMessage(chatId, formatReply(draft, { usedSources, candidatesFound, markerFound }));
 }
 
 export default async function handler(req, res) {

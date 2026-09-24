@@ -16,12 +16,21 @@ and post herself, manually, whenever she chooses.
 2. Telegram calls this project's webhook (`/api/webhook`), hosted on Vercel.
 3. If it's a voice note, [Gemini](https://ai.google.dev) transcribes it
    directly from audio (no separate speech-to-text service needed).
-4. The transcript (or typed text) is sent to a drafting model — Gemini by
-   default, or Claude if you set `DRAFT_PROVIDER=claude` — along with
+4. Gemini turns the fragment into 1-2 search queries, then the bot pulls
+   candidate supporting facts from Google Custom Search and Google News RSS
+   ([`lib/research.js`](lib/research.js)) — so Meera doesn't have to supply
+   all the research herself.
+5. The transcript, those research candidates, and (if she typed one) her own
+   supplied angle are all sent to a drafting model — Gemini by default, or
+   Claude if you set `DRAFT_PROVIDER=claude` — along with
    [`lib/voiceSkill.js`](lib/voiceSkill.js), which is Meera's voice-skill
-   instructions verbatim, as the system prompt.
-5. The draft is sent straight back to the same channel, clearly
-   labeled as a draft. Nothing is published or scheduled.
+   instructions verbatim, as the system prompt. The model is told to use a
+   research candidate only if it's genuinely specific and relevant — never
+   to force one in or fabricate a number.
+6. The draft is sent straight back to the same channel, clearly labeled as
+   a draft, with a footer listing any research links it actually drew on
+   (so she can verify a figure before posting). Nothing is published or
+   scheduled.
 
 Only posts from `ALLOWED_CHAT_ID` (Meera's channel) are processed — anyone
 else's messages are silently ignored, so a stranger can't burn your API
@@ -36,16 +45,16 @@ channel id for `ALLOWED_CHAT_ID`.
 
 ## Project layout
 
-```
-api/webhook.js       Telegram webhook handler (the entry point)
-lib/config.js         Environment variable / defaults
-lib/telegram.js        Telegram API calls (send message, download file)
-lib/transcribe.js      Gemini audio transcription
-lib/draft.js           Drafting call (Gemini or Claude) + system prompt
-lib/voiceSkill.js       Meera's voice-skill instructions (verbatim)
-scripts/set-webhook.js    One-off script to point Telegram at your deploy
-scripts/delete-webhook.js One-off script to remove the webhook
-```
+- `api/webhook.js` — Telegram webhook handler (the entry point)
+- `lib/config.js` — environment variable defaults
+- `lib/telegram.js` — Telegram API calls (send message, download file)
+- `lib/gemini.js` — shared Gemini caller (timeouts + retry on 503/429)
+- `lib/transcribe.js` — Gemini audio transcription
+- `lib/research.js` — Google Custom Search + Google News RSS
+- `lib/draft.js` — drafting call (Gemini or Claude) + system prompt
+- `lib/voiceSkill.js` — Meera's voice-skill instructions (verbatim)
+- `scripts/set-webhook.js` — one-off script to point Telegram at your deploy
+- `scripts/delete-webhook.js` — one-off script to remove the webhook
 
 ## Setup
 
@@ -72,6 +81,18 @@ scripts/delete-webhook.js One-off script to remove the webhook
   you switch providers): [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 - **Claude** (optional — only needed if you set `DRAFT_PROVIDER=claude`):
   [console.anthropic.com](https://console.anthropic.com)
+- **Google Custom Search** (optional but recommended — powers automatic web
+  research for every draft; without it the bot still gets Google News for
+  free, just not general web results):
+  1. In [Google Cloud Console](https://console.cloud.google.com), enable
+     the "Custom Search API" and create an API key. That's
+     `GOOGLE_SEARCH_API_KEY`.
+  2. At [programmablesearchengine.google.com](https://programmablesearchengine.google.com),
+     create a search engine and turn **"Search the entire web"** ON (it
+     defaults to specific sites only). Copy its Search Engine ID — that's
+     `GOOGLE_SEARCH_CX`.
+  3. Free tier is 100 queries/day, $5/1000 after. At 2-3 voice notes a
+     week, this stays free.
 
 ### 3. Deploy to Vercel
 
@@ -92,7 +113,13 @@ vercel env add GEMINI_API_KEY
 # optional:
 vercel env add ANTHROPIC_API_KEY
 vercel env add DRAFT_PROVIDER
+vercel env add GOOGLE_SEARCH_API_KEY
+vercel env add GOOGLE_SEARCH_CX
 ```
+
+If a value starts with `-` (some Telegram chat ids do), `vercel env add`
+can misparse it as a flag — pipe it in via stdin instead of typing it at
+the prompt, e.g. `printf '%s' "$ALLOWED_CHAT_ID" | vercel env add ALLOWED_CHAT_ID production`.
 
 See [`.env.example`](.env.example) for what each variable does.
 `TELEGRAM_WEBHOOK_SECRET` can be any long random string you make up — it's
@@ -124,10 +151,20 @@ few seconds, clearly labeled as a draft.
 
 - **Voice notes and typed fragments both work.** Anything sent as text or
   as a voice message is treated as raw material for a draft.
-- **Optional news angle:** add a line starting with `Angle:` (in a text
+- **Research is automatic, every time.** The bot turns the fragment into 1-2
+  search queries, checks Google Custom Search and Google News, and may weave
+  in one genuinely relevant, specific, checkable fact from what it finds —
+  never forced, never fabricated. If nothing relevant turns up, it drafts
+  from the fragment alone, same as before.
+- **A relevant research fact can also unlock a thin fragment.** Meera no
+  longer has to supply every number herself — if her own note is short on
+  specifics but the research turns up something concrete and on-topic, the
+  bot can use that as the anchor instead of asking her for more.
+- **Optional manual angle:** add a line starting with `Angle:` (in a text
   message, or in the caption of an audio file upload — not a voice note,
-  which Telegram doesn't let you caption) to hand the drafting model a news
-  angle or data point to weave into one supporting paragraph. For example:
+  which Telegram doesn't let you caption) to hand the drafting model a
+  specific angle or data point yourself. When supplied, her own angle takes
+  priority over anything the automatic research finds. For example:
 
   ```
   Just found out our return rate on the vitamin C serum dropped after we
@@ -137,9 +174,17 @@ few seconds, clearly labeled as a draft.
   expectations" rather than a defect.
   ```
 
-- **If a fragment is too thin to draft** (no concrete number, incident, or
-  detail — see Step 1 of the voice skill), the bot replies explaining what's
-  missing instead of forcing a shallow post.
+- **"Research used" footer:** when the draft actually drew on something the
+  bot found, the Telegram reply ends with a short footer listing those
+  links, so Meera can verify a figure before posting. This footer never
+  makes it into the LinkedIn post text itself.
+- **If a fragment is still too thin to draft**, even after research (no
+  concrete number, incident, or detail — see Step 1 of the voice skill), the
+  bot doesn't just say "need more detail" — it replies with one specific,
+  answerable clarifying question (e.g. a number or timeframe only Meera
+  would know). There's no conversation memory between messages, so she
+  answers it by sending a fresh note that includes the answer, rather than
+  replying in a thread.
 - `/start` in the chat gets a short usage reminder.
 
 ## Local development
