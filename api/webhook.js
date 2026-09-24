@@ -1,13 +1,16 @@
 import { config } from '../lib/config.js';
 import { sendMessage, sendChatAction, downloadFileAsBase64 } from '../lib/telegram.js';
 import { transcribeAudio } from '../lib/transcribe.js';
-import { generateDraft, NOT_ENOUGH_PREFIX } from '../lib/draft.js';
+import { generateDraft, buildVerifyFlagBlock, NOT_ENOUGH_PREFIX } from '../lib/draft.js';
+import { scoreNote, SCORE_THRESHOLD } from '../lib/score.js';
 
 const START_MESSAGE =
   "Hi, I'm your LinkedIn drafting bot.\n\n" +
   'Send me a voice note or a typed fragment - a half-formed thought, a reaction to a customer DM, ' +
   "a manufacturer conversation - and I'll draft a LinkedIn post in your voice, automatically pulling " +
-  'in supporting industry research and news where relevant.\n\n' +
+  'in a relevant news angle where one genuinely fits.\n\n' +
+  "Every note gets scored first - logistics reminders and abandoned half-thoughts get turned away " +
+  "with a reason instead of forcing a shallow draft.\n\n" +
   'Optional: add a line starting with "Angle:" (in a text message, or in the caption of an audio file) ' +
   "to hand me a specific news angle or data point yourself instead of relying on my own search.\n\n" +
   'I only ever draft. I never post or schedule anything - you review every draft here and post it yourself.';
@@ -26,36 +29,26 @@ function parseFragmentAndAngle(rawText) {
   return { fragment, angle };
 }
 
-// usedSources/candidatesFound/markerFound come straight from generateDraft():
-// - usedSources non-empty -> the model told us exactly which candidates it drew on.
-// - markerFound but usedSources empty -> the model explicitly used none of them.
-// - !markerFound but candidatesFound > 0 -> can't tell which (if any) were used.
-// - candidatesFound === 0 -> no research was even found, nothing to show.
-function formatResearchFooter({ usedSources, candidatesFound, markerFound }) {
-  if (usedSources.length) {
-    const lines = usedSources.map((s, i) => `${i + 1}. ${s.title} — ${s.link}`);
-    return `\n\n---\nResearch used for this draft (verify before posting):\n${lines.join('\n')}`;
-  }
-  if (!markerFound && candidatesFound > 0) {
-    return (
-      '\n\n---\nResearch was gathered but I could not confirm which parts (if any) made it ' +
-      'into the draft - verify anything specific before posting.'
-    );
-  }
-  return '';
-}
-
-function formatReply(draft, research) {
+function formatReply(draft, { newsItem, newsUsed }) {
   if (draft.startsWith(NOT_ENOUGH_PREFIX)) {
     return `Need more to go on before I can draft this one.\n\n${draft.slice(NOT_ENOUGH_PREFIX.length).trim()}`;
   }
+  const verifyFlag = newsUsed && newsItem ? `\n\n${buildVerifyFlagBlock(newsItem)}` : '';
   return (
     'Draft - for your review only. Nothing has been posted or scheduled.\n' +
     '—\n\n' +
     `${draft}\n\n` +
     '—\n' +
     'You post this yourself, whenever and if you want to.' +
-    formatResearchFooter(research)
+    verifyFlag
+  );
+}
+
+function formatRejectionMessage(score, reason) {
+  return (
+    "I'm not drafting this one.\n\n" +
+    `Score: ${score}/10 — ${reason}\n\n` +
+    "Send it again with more to work with (a specific incident, number, or opinion) if there's more there."
   );
 }
 
@@ -97,8 +90,15 @@ async function handleMessage(message) {
   }
 
   await sendChatAction(chatId, 'typing');
-  const { draft, usedSources, candidatesFound, markerFound } = await generateDraft(fragment, angle);
-  await sendMessage(chatId, formatReply(draft, { usedSources, candidatesFound, markerFound }));
+  const { score, reason } = await scoreNote(fragment);
+  if (score < SCORE_THRESHOLD) {
+    await sendMessage(chatId, formatRejectionMessage(score, reason));
+    return;
+  }
+
+  await sendChatAction(chatId, 'typing');
+  const { draft, newsItem, newsUsed } = await generateDraft(fragment, angle);
+  await sendMessage(chatId, formatReply(draft, { newsItem, newsUsed }));
 }
 
 export default async function handler(req, res) {
