@@ -17,9 +17,13 @@ and post herself, manually, whenever she chooses.
 3. If it's a voice note, [Gemini](https://ai.google.dev) transcribes it
    directly from audio (no separate speech-to-text service needed).
 4. Gemini turns the fragment into 1-2 search queries, then the bot pulls
-   candidate supporting facts from Google Custom Search and Google News RSS
+   candidate supporting facts from Google News
    ([`lib/research.js`](lib/research.js)) — so Meera doesn't have to supply
-   all the research herself.
+   all the research herself. (General web search isn't part of this: Google
+   deprecated whole-web search for newly created Custom Search API engines,
+   so that option was dropped rather than built against a dead end. See
+   [Adding general web search later](#adding-general-web-search-later) if
+   you want to revisit it with a different provider.)
 5. The transcript, those research candidates, and (if she typed one) her own
    supplied angle are all sent to a drafting model — Gemini by default, or
    Claude if you set `DRAFT_PROVIDER=claude` — along with
@@ -50,7 +54,7 @@ channel id for `ALLOWED_CHAT_ID`.
 - `lib/telegram.js` — Telegram API calls (send message, download file)
 - `lib/gemini.js` — shared Gemini caller (timeouts + retry on 503/429)
 - `lib/transcribe.js` — Gemini audio transcription
-- `lib/research.js` — Google Custom Search + Google News RSS
+- `lib/research.js` — Google News RSS research
 - `lib/draft.js` — drafting call (Gemini or Claude) + system prompt
 - `lib/voiceSkill.js` — Meera's voice-skill instructions (verbatim)
 - `scripts/set-webhook.js` — one-off script to point Telegram at your deploy
@@ -81,18 +85,9 @@ channel id for `ALLOWED_CHAT_ID`.
   you switch providers): [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
 - **Claude** (optional — only needed if you set `DRAFT_PROVIDER=claude`):
   [console.anthropic.com](https://console.anthropic.com)
-- **Google Custom Search** (optional but recommended — powers automatic web
-  research for every draft; without it the bot still gets Google News for
-  free, just not general web results):
-  1. In [Google Cloud Console](https://console.cloud.google.com), enable
-     the "Custom Search API" and create an API key. That's
-     `GOOGLE_SEARCH_API_KEY`.
-  2. At [programmablesearchengine.google.com](https://programmablesearchengine.google.com),
-     create a search engine and turn **"Search the entire web"** ON (it
-     defaults to specific sites only). Copy its Search Engine ID — that's
-     `GOOGLE_SEARCH_CX`.
-  3. Free tier is 100 queries/day, $5/1000 after. At 2-3 voice notes a
-     week, this stays free.
+
+No key is needed for the automatic research step — it uses Google News RSS,
+which is free and keyless.
 
 ### 3. Deploy to Vercel
 
@@ -113,8 +108,6 @@ vercel env add GEMINI_API_KEY
 # optional:
 vercel env add ANTHROPIC_API_KEY
 vercel env add DRAFT_PROVIDER
-vercel env add GOOGLE_SEARCH_API_KEY
-vercel env add GOOGLE_SEARCH_CX
 ```
 
 If a value starts with `-` (some Telegram chat ids do), `vercel env add`
@@ -152,10 +145,10 @@ few seconds, clearly labeled as a draft.
 - **Voice notes and typed fragments both work.** Anything sent as text or
   as a voice message is treated as raw material for a draft.
 - **Research is automatic, every time.** The bot turns the fragment into 1-2
-  search queries, checks Google Custom Search and Google News, and may weave
-  in one genuinely relevant, specific, checkable fact from what it finds —
-  never forced, never fabricated. If nothing relevant turns up, it drafts
-  from the fragment alone, same as before.
+  search queries, checks Google News, and may weave in one genuinely
+  relevant, specific, checkable fact from what it finds — never forced,
+  never fabricated. If nothing relevant turns up, it drafts from the
+  fragment alone, same as before.
 - **A relevant research fact can also unlock a thin fragment.** Meera no
   longer has to supply every number herself — if her own note is short on
   specifics but the research turns up something concrete and on-topic, the
@@ -199,3 +192,21 @@ iteration, editing and redeploying to a Vercel preview URL is simpler.
 Set `DRAFT_PROVIDER=gemini` (default) or `DRAFT_PROVIDER=claude` in your
 Vercel env vars. Transcription always uses Gemini either way, since Claude
 doesn't currently accept audio input directly.
+
+## Adding general web search later
+
+Google Custom Search API can no longer be configured to search the whole
+web for newly created search engines (Google deprecated that option) — it
+can only search specific domains you list, up to 50. That's why research
+here is Google News only for now. If you want general web search added
+back, options worth considering:
+
+- **Scope Google Custom Search to a curated list** of trusted
+  skincare/dermatology/beauty-industry/regulatory domains instead of the
+  whole web — narrower, but arguably higher-quality sources anyway.
+- **A different search API** that still does real whole-web search, e.g.
+  Bing Web Search (via Azure), SerpApi, or Brave Search — more setup and
+  likely a paid signup, but keeps genuine open-web reach.
+
+Either would slot into [`lib/research.js`](lib/research.js) alongside the
+existing Google News function.
