@@ -15,26 +15,36 @@ and post herself, manually, whenever she chooses.
    Telegram channel.
 2. Telegram calls this project's webhook (`/api/webhook`), hosted on Vercel.
 3. If it's a voice note, [Gemini](https://ai.google.dev) transcribes it
-   directly from audio (no separate speech-to-text service needed).
-4. Gemini turns the fragment into 1-2 search queries, then the bot pulls
-   candidate supporting facts from Google News
-   ([`lib/research.js`](lib/research.js)) — so Meera doesn't have to supply
-   all the research herself. (General web search isn't part of this: Google
-   deprecated whole-web search for newly created Custom Search API engines,
-   so that option was dropped rather than built against a dead end. See
+   directly from audio (no separate speech-to-text service needed). The note
+   is saved to Supabase (if configured) as soon as there's a transcript.
+4. Gemini **scores the note 0-10** on whether it has real substance —
+   a logistics reminder or an abandoned half-thought scores low and the
+   pipeline stops there, sending a short message explaining why instead of
+   forcing a shallow draft ([`lib/score.js`](lib/score.js)).
+5. If it passes, Gemini pulls 3-5 keywords into a search phrase, and the bot
+   fetches the single top matching Google News result — headline, source,
+   date, link ([`lib/research.js`](lib/research.js)). (General web search
+   isn't part of this: Google deprecated whole-web search for newly created
+   Custom Search API engines, so that option was dropped rather than built
+   against a dead end. See
    [Adding general web search later](#adding-general-web-search-later) if
    you want to revisit it with a different provider.)
-5. The transcript, those research candidates, and (if she typed one) her own
+6. The transcript, that news item (if any), and (if she typed one) her own
    supplied angle are all sent to a drafting model — Gemini by default, or
    Claude if you set `DRAFT_PROVIDER=claude` — along with
    [`lib/voiceSkill.js`](lib/voiceSkill.js), which is Meera's voice-skill
-   instructions verbatim, as the system prompt. The model is told to use a
-   research candidate only if it's genuinely specific and relevant — never
-   to force one in or fabricate a number.
-6. The draft is sent straight back to the same channel, clearly labeled as
-   a draft, with a footer listing any research links it actually drew on
-   (so she can verify a figure before posting). Nothing is published or
-   scheduled.
+   instructions verbatim, as the system prompt. The model is told to use the
+   news item only if it's genuinely relevant and fits naturally — never to
+   force it in or fabricate a claim.
+7. The draft is sent straight back to the same channel, clearly labeled as
+   a draft. If it used the news item, a verify-flag block (headline,
+   publication, date, link, and an explicit warning that she's the author of
+   record for that claim) is appended, built from the known fields rather
+   than left to the model to reproduce. Nothing is published or scheduled.
+8. The draft is saved to Supabase with status `pending` (if configured).
+   Replying **APPROVE** or **REJECT** to that message updates its status —
+   rejected notes and drafts are kept, not deleted, so they show what needs
+   improving.
 
 Only posts from `ALLOWED_CHAT_ID` (Meera's channel) are processed — anyone
 else's messages are silently ignored, so a stranger can't burn your API
@@ -54,9 +64,12 @@ channel id for `ALLOWED_CHAT_ID`.
 - `lib/telegram.js` — Telegram API calls (send message, download file)
 - `lib/gemini.js` — shared Gemini caller (timeouts + retry on 503/429)
 - `lib/transcribe.js` — Gemini audio transcription
-- `lib/research.js` — Google News RSS research
+- `lib/score.js` — pre-draft usability scoring (0-10 gate)
+- `lib/research.js` — Google News single-item research
 - `lib/draft.js` — drafting call (Gemini or Claude) + system prompt
 - `lib/voiceSkill.js` — Meera's voice-skill instructions (verbatim)
+- `lib/supabase.js` — memory layer (notes/drafts/voice_skill persistence)
+- `supabase/schema.sql` — table definitions + seeded voice-skill row
 - `scripts/set-webhook.js` — one-off script to point Telegram at your deploy
 - `scripts/delete-webhook.js` — one-off script to remove the webhook
 
@@ -89,7 +102,25 @@ channel id for `ALLOWED_CHAT_ID`.
 No key is needed for the automatic research step — it uses Google News RSS,
 which is free and keyless.
 
-### 3. Deploy to Vercel
+### 3. Set up the memory layer (Supabase)
+
+Optional, but needed for notes/drafts to be saved and for APPROVE/REJECT
+replies to work. Without it, the bot behaves exactly the same, it just
+doesn't remember anything between requests.
+
+1. Create a project at [supabase.com](https://supabase.com) (free tier is
+   plenty for this volume).
+2. In the Supabase dashboard, go to **SQL Editor → New query**, paste in the
+   contents of [`supabase/schema.sql`](supabase/schema.sql), and run it. This
+   creates the three tables (`notes`, `drafts`, `voice_skill`) and seeds
+   `voice_skill` with the current content of `lib/voiceSkill.js`.
+3. From **Project Settings → API**, copy:
+   - **Project URL** → `SUPABASE_URL`
+   - **service_role key** (not the `anon` key — this is a server-only secret
+     that bypasses row-level security, which is fine since it's only ever
+     used from this backend, never exposed to a client) → `SUPABASE_SERVICE_ROLE_KEY`
+
+### 4. Deploy to Vercel
 
 ```bash
 cd meera-linkedin-bot
@@ -108,6 +139,8 @@ vercel env add GEMINI_API_KEY
 # optional:
 vercel env add ANTHROPIC_API_KEY
 vercel env add DRAFT_PROVIDER
+vercel env add SUPABASE_URL
+vercel env add SUPABASE_SERVICE_ROLE_KEY
 ```
 
 If a value starts with `-` (some Telegram chat ids do), `vercel env add`
@@ -124,7 +157,7 @@ Deploy to production:
 vercel --prod
 ```
 
-### 4. Point Telegram at your deployment
+### 5. Point Telegram at your deployment
 
 ```bash
 TELEGRAM_BOT_TOKEN=your-token \
@@ -135,29 +168,32 @@ node scripts/set-webhook.js https://your-project.vercel.app
 (Use the same values you set in Vercel's env vars.) Re-run this any time
 your deployment URL changes.
 
-### 5. Try it
+### 6. Try it
 
 Post a voice note into the channel. You should get a draft back within a
-few seconds, clearly labeled as a draft.
+few seconds, clearly labeled as a draft. Reply APPROVE or REJECT to it, and
+(if Supabase is set up) check the `drafts` table — the status should update.
 
 ## Usage notes
 
 - **Voice notes and typed fragments both work.** Anything sent as text or
   as a voice message is treated as raw material for a draft.
-- **Research is automatic, every time.** The bot turns the fragment into 1-2
-  search queries, checks Google News, and may weave in one genuinely
-  relevant, specific, checkable fact from what it finds — never forced,
+- **Every note is scored before drafting.** Gemini scores it 0-10 on
+  substance — a logistics reminder ("call the packaging vendor tomorrow")
+  or an abandoned half-thought scores low (the threshold is 6) and the
+  pipeline stops, sending back the score and a one-line reason instead of
+  forcing a draft. A note with a real incident, number, or opinion passes
+  through to drafting.
+- **News research is automatic, every time a note passes scoring.** The bot
+  pulls one candidate news item from Google News and tells the model to use
+  it only if it's genuinely relevant and fits naturally — never forced,
   never fabricated. If nothing relevant turns up, it drafts from the
-  fragment alone, same as before.
-- **A relevant research fact can also unlock a thin fragment.** Meera no
-  longer has to supply every number herself — if her own note is short on
-  specifics but the research turns up something concrete and on-topic, the
-  bot can use that as the anchor instead of asking her for more.
+  fragment alone.
 - **Optional manual angle:** add a line starting with `Angle:` (in a text
   message, or in the caption of an audio file upload — not a voice note,
   which Telegram doesn't let you caption) to hand the drafting model a
   specific angle or data point yourself. When supplied, her own angle takes
-  priority over anything the automatic research finds. For example:
+  priority over whatever news item the bot found automatically. For example:
 
   ```
   Just found out our return rate on the vitamin C serum dropped after we
@@ -167,17 +203,22 @@ few seconds, clearly labeled as a draft.
   expectations" rather than a defect.
   ```
 
-- **"Research used" footer:** when the draft actually drew on something the
-  bot found, the Telegram reply ends with a short footer listing those
-  links, so Meera can verify a figure before posting. This footer never
-  makes it into the LinkedIn post text itself.
-- **If a fragment is still too thin to draft**, even after research (no
-  concrete number, incident, or detail — see Step 1 of the voice skill), the
-  bot doesn't just say "need more detail" — it replies with one specific,
-  answerable clarifying question (e.g. a number or timeframe only Meera
-  would know). There's no conversation memory between messages, so she
-  answers it by sending a fresh note that includes the answer, rather than
-  replying in a thread.
+- **Verify-flag block:** when the draft actually used the news item, the
+  Telegram reply ends with a fixed-format block — headline, publication,
+  date, link, and an explicit warning that she's the author of record for
+  that claim — so she can check it before posting. This block never makes
+  it into the LinkedIn post text itself, and it's built from the known
+  fields in code, not left to the model to reproduce verbatim.
+- **If a fragment is still too thin to draft**, even after passing scoring
+  and with no relevant news to anchor it (rare, since scoring already
+  filters most of these out), the bot replies with one specific, answerable
+  clarifying question (e.g. a number or timeframe only Meera would know)
+  instead of a generic "need more detail." There's no conversation memory
+  between messages for this case, so she answers it by sending a fresh note
+  that includes the answer, rather than replying in a thread.
+- **Reply APPROVE or REJECT to any draft** to record a decision (requires
+  Supabase to be configured — see Setup step 3). Rejected notes and drafts
+  are kept, not deleted, so they show what needs improving.
 - `/start` in the chat gets a short usage reminder.
 
 ## Local development

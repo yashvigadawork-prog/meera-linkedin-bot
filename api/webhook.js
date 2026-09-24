@@ -3,6 +3,14 @@ import { sendMessage, sendChatAction, downloadFileAsBase64 } from '../lib/telegr
 import { transcribeAudio } from '../lib/transcribe.js';
 import { generateDraft, buildVerifyFlagBlock, NOT_ENOUGH_PREFIX } from '../lib/draft.js';
 import { scoreNote, SCORE_THRESHOLD } from '../lib/score.js';
+import {
+  insertNote,
+  updateNote,
+  insertDraft,
+  updateDraft,
+  findPendingDraftByMessageId,
+  getActiveVoiceSkillId,
+} from '../lib/supabase.js';
 
 const START_MESSAGE =
   "Hi, I'm your LinkedIn drafting bot.\n\n" +
@@ -13,7 +21,19 @@ const START_MESSAGE =
   "with a reason instead of forcing a shallow draft.\n\n" +
   'Optional: add a line starting with "Angle:" (in a text message, or in the caption of an audio file) ' +
   "to hand me a specific news angle or data point yourself instead of relying on my own search.\n\n" +
+  'Reply APPROVE or REJECT to any draft I send to record your decision.\n\n' +
   'I only ever draft. I never post or schedule anything - you review every draft here and post it yourself.';
+
+// Persistence is best-effort: a Supabase hiccup should never stop Meera
+// from getting her actual draft. Errors are logged, never thrown further.
+async function safe(promise, label) {
+  try {
+    return await promise;
+  } catch (err) {
+    console.error(`meera-linkedin-bot: ${label} failed (continuing):`, err);
+    return null;
+  }
+}
 
 // Splits raw input into the actual fragment and an optional supplied
 // "Angle:" line, e.g. a news angle or industry data point to weave in.
@@ -39,7 +59,8 @@ function formatReply(draft, { newsItem, newsUsed }) {
     '—\n\n' +
     `${draft}\n\n` +
     '—\n' +
-    'You post this yourself, whenever and if you want to.' +
+    'You post this yourself, whenever and if you want to.\n' +
+    'Reply APPROVE or REJECT to record your decision.' +
     verifyFlag
   );
 }
@@ -52,6 +73,37 @@ function formatRejectionMessage(score, reason) {
   );
 }
 
+// Returns true if the message was handled as an APPROVE/REJECT reply
+// (whether or not it matched a tracked draft), false if it should fall
+// through to normal note handling.
+async function handleApproveReject(message) {
+  if (!message.reply_to_message || typeof message.text !== 'string') return false;
+  const decision = message.text.trim().toUpperCase();
+  if (decision !== 'APPROVE' && decision !== 'REJECT') return false;
+
+  const chatId = message.chat.id;
+  const draftRow = await safe(
+    findPendingDraftByMessageId(message.reply_to_message.message_id),
+    'findPendingDraftByMessageId'
+  );
+
+  if (!draftRow) {
+    await sendMessage(chatId, "I couldn't find a pending draft matching that reply.");
+    return true;
+  }
+
+  const status = decision === 'APPROVE' ? 'approved' : 'rejected';
+  await safe(
+    updateDraft(draftRow.id, { status, decided_at: new Date().toISOString() }),
+    'updateDraft (approve/reject)'
+  );
+  await sendMessage(
+    chatId,
+    status === 'approved' ? 'Marked as approved.' : 'Marked as rejected - kept on file for review.'
+  );
+  return true;
+}
+
 async function handleMessage(message) {
   const chatId = message.chat.id;
 
@@ -60,12 +112,16 @@ async function handleMessage(message) {
     return;
   }
 
+  if (await handleApproveReject(message)) return;
+
   let fragment = '';
   let angle = '';
+  let sourceType = 'text';
 
   if (message.voice || message.audio) {
     const media = message.voice || message.audio;
     const mimeType = media.mime_type || 'audio/ogg';
+    sourceType = 'voice';
 
     await sendChatAction(chatId, 'typing');
     const base64Audio = await downloadFileAsBase64(media.file_id);
@@ -89,16 +145,59 @@ async function handleMessage(message) {
     return;
   }
 
+  const noteRow = await safe(
+    insertNote({
+      telegram_chat_id: String(chatId),
+      telegram_message_id: message.message_id,
+      source_type: sourceType,
+      raw_text: message.text || message.caption || null,
+      transcript: fragment,
+      manual_angle: angle || null,
+      status: 'pending',
+    }),
+    'insertNote'
+  );
+
   await sendChatAction(chatId, 'typing');
   const { score, reason } = await scoreNote(fragment);
   if (score < SCORE_THRESHOLD) {
+    await safe(
+      updateNote(noteRow?.id, { status: 'scored_low', score, score_reason: reason }),
+      'updateNote (scored_low)'
+    );
     await sendMessage(chatId, formatRejectionMessage(score, reason));
     return;
   }
+  await safe(
+    updateNote(noteRow?.id, { status: 'scored_high', score, score_reason: reason }),
+    'updateNote (scored_high)'
+  );
 
   await sendChatAction(chatId, 'typing');
   const { draft, newsItem, newsUsed } = await generateDraft(fragment, angle);
-  await sendMessage(chatId, formatReply(draft, { newsItem, newsUsed }));
+  const replyMessageIds = await sendMessage(chatId, formatReply(draft, { newsItem, newsUsed }));
+
+  // The "not enough to draft" fallback isn't a real, postable draft - it's
+  // a clarifying question - so it isn't saved as one, and there's nothing
+  // for her to APPROVE/REJECT.
+  if (draft.startsWith(NOT_ENOUGH_PREFIX)) return;
+
+  const voiceSkillId = await safe(getActiveVoiceSkillId(), 'getActiveVoiceSkillId');
+  await safe(
+    insertDraft({
+      note_id: noteRow?.id,
+      voice_skill_id: voiceSkillId,
+      draft_text: draft,
+      news_used: newsUsed,
+      news_headline: newsItem?.headline || null,
+      news_source: newsItem?.source || null,
+      news_date: newsItem?.date || null,
+      news_link: newsItem?.link || null,
+      telegram_reply_message_ids: replyMessageIds,
+      status: 'pending',
+    }),
+    'insertDraft'
+  );
 }
 
 export default async function handler(req, res) {
