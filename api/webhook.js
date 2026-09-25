@@ -9,6 +9,7 @@ import {
   insertDraft,
   updateDraft,
   findPendingDraftByMessageId,
+  findMostRecentPendingDraft,
   getActiveVoiceSkillId,
 } from '../lib/supabase.js';
 
@@ -73,22 +74,32 @@ function formatRejectionMessage(score, reason) {
   );
 }
 
-// Returns true if the message was handled as an APPROVE/REJECT reply
+// Returns true if the message was handled as an APPROVE/REJECT decision
 // (whether or not it matched a tracked draft), false if it should fall
-// through to normal note handling.
+// through to normal note handling. Works whether or not she used
+// Telegram's native reply gesture - confirmed directly that typing a bare
+// "APPROVE" as a plain new message, without replying, is a real usage
+// pattern, so an explicit reply is used for precision when present, and a
+// fallback to the most recent pending draft otherwise.
 async function handleApproveReject(message) {
-  if (!message.reply_to_message || typeof message.text !== 'string') return false;
+  if (typeof message.text !== 'string') return false;
   const decision = message.text.trim().toUpperCase();
   if (decision !== 'APPROVE' && decision !== 'REJECT') return false;
 
   const chatId = message.chat.id;
-  const draftRow = await safe(
-    findPendingDraftByMessageId(message.reply_to_message.message_id),
-    'findPendingDraftByMessageId'
-  );
+  let draftRow = null;
+  if (message.reply_to_message) {
+    draftRow = await safe(
+      findPendingDraftByMessageId(message.reply_to_message.message_id),
+      'findPendingDraftByMessageId'
+    );
+  }
+  if (!draftRow) {
+    draftRow = await safe(findMostRecentPendingDraft(chatId), 'findMostRecentPendingDraft');
+  }
 
   if (!draftRow) {
-    await sendMessage(chatId, "I couldn't find a pending draft matching that reply.");
+    await sendMessage(chatId, "I couldn't find a pending draft to mark - nothing's waiting on a decision right now.");
     return true;
   }
 
@@ -224,6 +235,16 @@ export default async function handler(req, res) {
   // Always ack fast with 200 so Telegram doesn't retry-storm us; do the
   // actual work first since Vercel functions don't run work after response.
   if (!message || !message.chat) {
+    res.status(200).json({ ok: true });
+    return;
+  }
+
+  // Telegram relays a bot's own channel posts back through the webhook
+  // just like anyone else's - confirmed directly in production: without
+  // this check, the bot re-processed its own draft replies as new
+  // incoming notes and redrafted them. from.id is the bot's own Telegram
+  // user id whenever it's the one posting.
+  if (String(message.from?.id) === String(config.telegramBotId())) {
     res.status(200).json({ ok: true });
     return;
   }
