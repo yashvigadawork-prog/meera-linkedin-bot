@@ -27,11 +27,18 @@ create table notes (
   manual_angle text,
   score int,
   score_reason text,
+  -- The proposed format/outline sent before drafting, and the Telegram
+  -- message id(s) it was sent as - an incoming reply is matched back to
+  -- the note it's answering the same way a draft reply is matched to a
+  -- draft (see drafts.telegram_reply_message_ids below).
+  outline_text text,
+  outline_message_ids integer[] not null default '{}',
   status text not null default 'pending'
-    check (status in ('pending', 'scored_low', 'scored_high')),
+    check (status in ('pending', 'scored_low', 'scored_high', 'outline_sent', 'drafted')),
   created_at timestamptz not null default now()
 );
 create index notes_chat_id_idx on notes (telegram_chat_id);
+create index notes_outline_ids_idx on notes using gin (outline_message_ids);
 
 create table drafts (
   id uuid primary key default gen_random_uuid(),

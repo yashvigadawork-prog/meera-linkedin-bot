@@ -3,6 +3,7 @@ import { sendMessage, sendChatAction, downloadFileAsBase64 } from '../lib/telegr
 import { transcribeAudio } from '../lib/transcribe.js';
 import { generateDraft, buildVerifyFlagBlock, NOT_ENOUGH_PREFIX } from '../lib/draft.js';
 import { scoreNote, SCORE_THRESHOLD } from '../lib/score.js';
+import { proposeOutline } from '../lib/outline.js';
 import {
   insertNote,
   updateNote,
@@ -10,18 +11,20 @@ import {
   updateDraft,
   findPendingDraftByMessageId,
   findMostRecentPendingDraft,
+  findNoteAwaitingOutlineByMessageId,
+  findMostRecentNoteAwaitingOutline,
   getActiveVoiceSkillId,
 } from '../lib/supabase.js';
 
 const START_MESSAGE =
   "Hi, I'm your LinkedIn drafting bot.\n\n" +
   'Send me a voice note or a typed fragment - a half-formed thought, a reaction to a customer DM, ' +
-  "a manufacturer conversation - and I'll draft a LinkedIn post in your voice, automatically pulling " +
-  'in a relevant news angle where one genuinely fits.\n\n' +
-  "Every note gets scored first - logistics reminders and abandoned half-thoughts get turned away " +
-  "with a reason instead of forcing a shallow draft.\n\n" +
-  'Optional: add a line starting with "Angle:" (in a text message, or in the caption of an audio file) ' +
-  "to hand me a specific news angle or data point yourself instead of relying on my own search.\n\n" +
+  "a manufacturer conversation. If it passes a quick usability check, I'll propose a format " +
+  '(short or long) and a basic outline before writing anything. Reply to approve it or tell me ' +
+  "what to change, and I'll draft from there - pulling in a relevant news angle where one " +
+  'genuinely fits.\n\n' +
+  'Optional: add a line starting with "Angle:" (in a text message, or in the caption of an audio ' +
+  'file) to hand me a specific news angle or data point yourself instead of relying on my own search.\n\n' +
   'Reply APPROVE or REJECT to any draft I send to record your decision.\n\n' +
   'I only ever draft. I never post or schedule anything - you review every draft here and post it yourself.';
 
@@ -50,6 +53,15 @@ function parseFragmentAndAngle(rawText) {
   return { fragment, angle };
 }
 
+function formatOutlineMessage(outlineText) {
+  return (
+    "Before I draft, here's the plan:\n\n" +
+    `${outlineText}\n\n` +
+    'Reply with your answer - "approve", a length ("short"/"long"), or what to change - ' +
+    "and I'll draft from there."
+  );
+}
+
 function formatReply(draft, { newsItem, newsUsed }) {
   if (draft.startsWith(NOT_ENOUGH_PREFIX)) {
     return `Need more to go on before I can draft this one.\n\n${draft.slice(NOT_ENOUGH_PREFIX.length).trim()}`;
@@ -76,11 +88,11 @@ function formatRejectionMessage(score, reason) {
 
 // Returns true if the message was handled as an APPROVE/REJECT decision
 // (whether or not it matched a tracked draft), false if it should fall
-// through to normal note handling. Works whether or not she used
-// Telegram's native reply gesture - confirmed directly that typing a bare
-// "APPROVE" as a plain new message, without replying, is a real usage
-// pattern, so an explicit reply is used for precision when present, and a
-// fallback to the most recent pending draft otherwise.
+// through. Works whether or not she used Telegram's native reply gesture -
+// confirmed directly that typing a bare "APPROVE" as a plain new message,
+// without replying, is a real usage pattern, so an explicit reply is used
+// for precision when present, and a fallback to the most recent pending
+// draft otherwise.
 async function handleApproveReject(message) {
   if (typeof message.text !== 'string') return false;
   const decision = message.text.trim().toUpperCase();
@@ -98,10 +110,7 @@ async function handleApproveReject(message) {
     draftRow = await safe(findMostRecentPendingDraft(chatId), 'findMostRecentPendingDraft');
   }
 
-  if (!draftRow) {
-    await sendMessage(chatId, "I couldn't find a pending draft to mark - nothing's waiting on a decision right now.");
-    return true;
-  }
+  if (!draftRow) return false; // no pending draft - might be an outline reply instead
 
   const status = decision === 'APPROVE' ? 'approved' : 'rejected';
   await safe(
@@ -115,6 +124,67 @@ async function handleApproveReject(message) {
   return true;
 }
 
+// Runs the actual drafting step and saves the result - shared by the
+// outline-reply path (the only place drafting happens now).
+async function draftAndSend(chatId, noteRow, outlineFeedback) {
+  await sendChatAction(chatId, 'typing');
+  const { draft, newsItem, newsUsed } = await generateDraft(
+    noteRow.transcript,
+    noteRow.manual_angle,
+    outlineFeedback
+  );
+  const replyMessageIds = await sendMessage(chatId, formatReply(draft, { newsItem, newsUsed }));
+
+  await safe(updateNote(noteRow.id, { status: 'drafted' }), 'updateNote (drafted)');
+
+  // The "not enough to draft" fallback isn't a real, postable draft - it's
+  // a clarifying question - so it isn't saved as one, and there's nothing
+  // for her to APPROVE/REJECT.
+  if (draft.startsWith(NOT_ENOUGH_PREFIX)) return;
+
+  const voiceSkillId = await safe(getActiveVoiceSkillId(), 'getActiveVoiceSkillId');
+  await safe(
+    insertDraft({
+      note_id: noteRow.id,
+      voice_skill_id: voiceSkillId,
+      draft_text: draft,
+      news_used: newsUsed,
+      news_headline: newsItem?.headline || null,
+      news_source: newsItem?.source || null,
+      news_date: newsItem?.date || null,
+      news_link: newsItem?.link || null,
+      telegram_reply_message_ids: replyMessageIds,
+      status: 'pending',
+    }),
+    'insertDraft'
+  );
+}
+
+// Returns true if this message was handled as a reply to a pending
+// outline (whether or not it matched one), false otherwise. Voice/audio
+// messages are never treated as outline replies - she wouldn't record a
+// voice note just to say "approve" or "make it short."
+async function handleOutlineReply(message) {
+  if (message.voice || message.audio) return false;
+  if (typeof message.text !== 'string' || !message.text.trim()) return false;
+
+  const chatId = message.chat.id;
+  let noteRow = null;
+  if (message.reply_to_message) {
+    noteRow = await safe(
+      findNoteAwaitingOutlineByMessageId(message.reply_to_message.message_id),
+      'findNoteAwaitingOutlineByMessageId'
+    );
+  }
+  if (!noteRow) {
+    noteRow = await safe(findMostRecentNoteAwaitingOutline(chatId), 'findMostRecentNoteAwaitingOutline');
+  }
+  if (!noteRow) return false; // no pending outline - treat as a new note instead
+
+  await draftAndSend(chatId, noteRow, message.text.trim());
+  return true;
+}
+
 async function handleMessage(message) {
   const chatId = message.chat.id;
 
@@ -123,7 +193,23 @@ async function handleMessage(message) {
     return;
   }
 
+  const decisionText =
+    typeof message.text === 'string' && ['APPROVE', 'REJECT'].includes(message.text.trim().toUpperCase());
+
   if (await handleApproveReject(message)) return;
+  if (await handleOutlineReply(message)) return;
+
+  // A bare APPROVE/REJECT that matched neither a pending draft nor a
+  // pending outline - say so plainly rather than silently scoring the
+  // literal word "APPROVE" as if it were a new note (confirmed directly:
+  // that produced a confusing "score 0/10, single word command" reply).
+  if (decisionText) {
+    await sendMessage(
+      chatId,
+      "I couldn't find a pending draft or outline to mark - nothing's waiting on a decision right now."
+    );
+    return;
+  }
 
   let fragment = '';
   let angle = '';
@@ -179,35 +265,20 @@ async function handleMessage(message) {
     await sendMessage(chatId, formatRejectionMessage(score, reason));
     return;
   }
-  await safe(
-    updateNote(noteRow?.id, { status: 'scored_high', score, score_reason: reason }),
-    'updateNote (scored_high)'
-  );
 
   await sendChatAction(chatId, 'typing');
-  const { draft, newsItem, newsUsed } = await generateDraft(fragment, angle);
-  const replyMessageIds = await sendMessage(chatId, formatReply(draft, { newsItem, newsUsed }));
+  const outlineText = await proposeOutline(fragment, angle);
+  const outlineMessageIds = await sendMessage(chatId, formatOutlineMessage(outlineText));
 
-  // The "not enough to draft" fallback isn't a real, postable draft - it's
-  // a clarifying question - so it isn't saved as one, and there's nothing
-  // for her to APPROVE/REJECT.
-  if (draft.startsWith(NOT_ENOUGH_PREFIX)) return;
-
-  const voiceSkillId = await safe(getActiveVoiceSkillId(), 'getActiveVoiceSkillId');
   await safe(
-    insertDraft({
-      note_id: noteRow?.id,
-      voice_skill_id: voiceSkillId,
-      draft_text: draft,
-      news_used: newsUsed,
-      news_headline: newsItem?.headline || null,
-      news_source: newsItem?.source || null,
-      news_date: newsItem?.date || null,
-      news_link: newsItem?.link || null,
-      telegram_reply_message_ids: replyMessageIds,
-      status: 'pending',
+    updateNote(noteRow?.id, {
+      status: 'outline_sent',
+      score,
+      score_reason: reason,
+      outline_text: outlineText,
+      outline_message_ids: outlineMessageIds,
     }),
-    'insertDraft'
+    'updateNote (outline_sent)'
   );
 }
 

@@ -21,30 +21,43 @@ and post herself, manually, whenever she chooses.
    a logistics reminder or an abandoned half-thought scores low and the
    pipeline stops there, sending a short message explaining why instead of
    forcing a shallow draft ([`lib/score.js`](lib/score.js)).
-5. If it passes, Gemini pulls 3-5 keywords into a search phrase, and the bot
-   fetches the single top matching Google News result — headline, source,
-   date, link ([`lib/research.js`](lib/research.js)). (General web search
-   isn't part of this: Google deprecated whole-web search for newly created
-   Custom Search API engines, so that option was dropped rather than built
-   against a dead end. See
+5. If it passes, the bot **proposes a plan before writing anything**: a
+   recommended length (short ~150-250 words, or long ~300-600 words) with a
+   reason, and a basic outline (hook approach, what each part covers, how it
+   closes) — [`lib/outline.js`](lib/outline.js). This is sent to the channel
+   and the note's status becomes `outline_sent`; drafting does not start
+   yet.
+6. Meera replies with her answer — "approve", a length, requested changes,
+   anything. The bot matches the reply back to the note it's answering
+   (via Telegram's reply-to-message id, or the most recent pending outline
+   for the chat if she didn't use the reply gesture) and treats whatever
+   she wrote as instructions for the draft.
+7. Gemini pulls 3-5 keywords into a search phrase, and the bot fetches the
+   single top matching Google News result — headline, source, date, link
+   ([`lib/research.js`](lib/research.js)). (General web search isn't part
+   of this: Google deprecated whole-web search for newly created Custom
+   Search API engines, so that option was dropped rather than built against
+   a dead end. See
    [Adding general web search later](#adding-general-web-search-later) if
    you want to revisit it with a different provider.)
-6. The transcript, that news item (if any), and (if she typed one) her own
-   supplied angle are all sent to a drafting model — Gemini by default, or
-   Claude if you set `DRAFT_PROVIDER=claude` — along with
+8. The transcript, Meera's reply to the outline, that news item (if any),
+   and (if she typed one in the original note) her own supplied angle are
+   all sent to a drafting model — Gemini by default, or Claude if you set
+   `DRAFT_PROVIDER=claude` — along with
    [`lib/voiceSkill.js`](lib/voiceSkill.js), which is Meera's voice-skill
-   instructions verbatim, as the system prompt. The model is told to use the
-   news item only if it's genuinely relevant and fits naturally — never to
-   force it in or fabricate a claim.
-7. The draft is sent straight back to the same channel, clearly labeled as
+   instructions verbatim, as the system prompt. The model is told to follow
+   her length choice and any changes she asked for, and to use the news
+   item only if it's genuinely relevant and fits naturally — never to force
+   it in or fabricate a claim.
+9. The draft is sent straight back to the same channel, clearly labeled as
    a draft. If it used the news item, a verify-flag block (headline,
    publication, date, link, and an explicit warning that she's the author of
    record for that claim) is appended, built from the known fields rather
    than left to the model to reproduce. Nothing is published or scheduled.
-8. The draft is saved to Supabase with status `pending` (if configured).
-   Replying **APPROVE** or **REJECT** to that message updates its status —
-   rejected notes and drafts are kept, not deleted, so they show what needs
-   improving.
+10. The draft is saved to Supabase with status `pending` (if configured).
+    Replying **APPROVE** or **REJECT** to that message updates its status —
+    rejected notes and drafts are kept, not deleted, so they show what needs
+    improving.
 
 Only posts from `ALLOWED_CHAT_ID` (Meera's channel) are processed — anyone
 else's messages are silently ignored, so a stranger can't burn your API
@@ -65,11 +78,13 @@ channel id for `ALLOWED_CHAT_ID`.
 - `lib/gemini.js` — shared Gemini caller (timeouts + retry on 503/429)
 - `lib/transcribe.js` — Gemini audio transcription
 - `lib/score.js` — pre-draft usability scoring (0-10 gate)
+- `lib/outline.js` — proposes format + outline before drafting
 - `lib/research.js` — Google News single-item research
 - `lib/draft.js` — drafting call (Gemini or Claude) + system prompt
 - `lib/voiceSkill.js` — Meera's voice-skill instructions (verbatim)
 - `lib/supabase.js` — memory layer (notes/drafts/voice_skill persistence)
-- `supabase/schema.sql` — table definitions + seeded voice-skill row
+- `supabase/schema.sql` — table definitions + seeded voice-skill row (fresh installs)
+- `supabase/migration_outline.sql` — adds the outline stage to an existing install
 - `scripts/set-webhook.js` — one-off script to point Telegram at your deploy
 - `scripts/delete-webhook.js` — one-off script to remove the webhook
 
@@ -104,9 +119,11 @@ which is free and keyless.
 
 ### 3. Set up the memory layer (Supabase)
 
-Optional, but needed for notes/drafts to be saved and for APPROVE/REJECT
-replies to work. Without it, the bot behaves exactly the same, it just
-doesn't remember anything between requests.
+**Required for the outline-approval step** (the bot can't remember a
+proposed outline is waiting for her reply without somewhere to store that).
+Also needed for notes/drafts to be saved and for APPROVE/REJECT replies to
+work. Without it, drafting no longer happens at all, since it now only
+starts after a reply to a proposed outline that has to be tracked somewhere.
 
 1. Create a project at [supabase.com](https://supabase.com) (free tier is
    plenty for this volume).
@@ -114,6 +131,10 @@ doesn't remember anything between requests.
    contents of [`supabase/schema.sql`](supabase/schema.sql), and run it. This
    creates the three tables (`notes`, `drafts`, `voice_skill`) and seeds
    `voice_skill` with the current content of `lib/voiceSkill.js`.
+   - **Already have this schema from before the outline step existed?** Run
+     [`supabase/migration_outline.sql`](supabase/migration_outline.sql)
+     instead (or as well) — it adds the two new columns and widens the
+     status values without touching existing data.
 3. From **Project Settings → API**, copy:
    - **Project URL** → `SUPABASE_URL`
    - **service_role key** (not the `anon` key — this is a server-only secret
@@ -178,13 +199,20 @@ few seconds, clearly labeled as a draft. Reply APPROVE or REJECT to it, and
 
 - **Voice notes and typed fragments both work.** Anything sent as text or
   as a voice message is treated as raw material for a draft.
-- **Every note is scored before drafting.** Gemini scores it 0-10 on
+- **Every note is scored before anything else.** Gemini scores it 0-10 on
   substance — a logistics reminder ("call the packaging vendor tomorrow")
   or an abandoned half-thought scores low (the threshold is 6) and the
   pipeline stops, sending back the score and a one-line reason instead of
   forcing a draft. A note with a real incident, number, or opinion passes
-  through to drafting.
-- **News research is automatic, every time a note passes scoring.** The bot
+  through.
+- **A note that passes scoring gets a plan proposed, not a draft.** The bot
+  sends a recommended length (short/long, with a reason) and a basic
+  outline, then waits. Nothing gets drafted until she replies - "approve",
+  a length, or specific changes all work, since her reply is passed to the
+  drafting model as-is. She doesn't need to use Telegram's reply gesture;
+  a plain new message is matched to whichever outline is still pending.
+- **News research runs once a note has an approved plan**, right before
+  drafting. The bot
   pulls one candidate news item from Google News and tells the model to use
   it only if it's genuinely relevant and fits naturally — never forced,
   never fabricated. If nothing relevant turns up, it drafts from the
