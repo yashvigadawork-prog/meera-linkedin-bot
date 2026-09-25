@@ -267,7 +267,24 @@ async function handleMessage(message) {
   }
 
   await sendChatAction(chatId, 'typing');
-  const outlineText = await proposeOutline(fragment, angle);
+  let outlineText;
+  try {
+    outlineText = await proposeOutline(fragment, angle);
+  } catch (err) {
+    // Confirmed directly in production: an unhandled failure here left a
+    // real, well-scored note permanently stuck at scored_high with no
+    // outline sent - the generic error handler told her to "try again,"
+    // but resending just scores as a new note; the original was orphaned.
+    // A fallback outline means this step can never dead-end the pipeline.
+    console.error('proposeOutline failed, using fallback outline:', err);
+    outlineText =
+      'Format: Long (~300-600 words) - my planning step hit an error, so this is a ' +
+      "generic default; tell me if you'd rather go short.\n\n" +
+      'Outline:\n' +
+      '- Hook: the specific detail or incident from your note\n' +
+      '- Body: what happened, why, and what it means\n' +
+      '- Close: an action or question for the reader';
+  }
   const outlineMessageIds = await sendMessage(chatId, formatOutlineMessage(outlineText));
 
   await safe(
